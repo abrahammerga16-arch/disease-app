@@ -17,7 +17,8 @@ app = Flask(__name__)
 CORS(app)
 
 # ─── Load CSVs ────────────────────────────────────────────────────────────────
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DATA_DIR   = os.path.join(os.path.dirname(__file__), "data")
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 main_df        = pd.read_csv(os.path.join(DATA_DIR, "Diseases_and_Symptoms_dataset.csv"))
 description_df = pd.read_csv(os.path.join(DATA_DIR, "description.csv"))
@@ -27,32 +28,24 @@ precautions_df = pd.read_csv(os.path.join(DATA_DIR, "precautions.csv"))
 workout_df     = pd.read_csv(os.path.join(DATA_DIR, "workout.csv"))
 
 # ─── Load Models ──────────────────────────────────────────────────────────────
-MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
-
 loaded_svc_model = joblib.load(os.path.join(MODELS_DIR, "svc_model.pkl"))
 loaded_dt_model  = joblib.load(os.path.join(MODELS_DIR, "decision_tree_model.pkl"))
 loaded_le        = joblib.load(os.path.join(MODELS_DIR, "label_encoder.pkl"))
-
 print("✅ Models and datasets loaded.")
 
-# ─── Feature matrix (symptom columns) ────────────────────────────────────────
-X = main_df.drop(columns=["diseases"])
+# ─── Feature matrix ───────────────────────────────────────────────────────────
+X            = main_df.drop(columns=["diseases"])
 symptom_list = X.columns.tolist()
-
-# ─── Sentence Transformer ─────────────────────────────────────────────────────
-print("Loading sentence transformer model...")
-semantic_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-symptom_embeddings = semantic_model.encode(symptom_list, show_progress_bar=False)
 
 # ─── Disease info maps ────────────────────────────────────────────────────────
 def clean_disease_name(name):
     return str(name).lower().replace("_", " ").strip()
 
-description_map  = {clean_disease_name(r["Disease"]): r["Description"]  for _, r in description_df.iterrows()}
-diets_map        = {clean_disease_name(r["Disease"]): r["Diet"]          for _, r in diets_df.iterrows()}
-medications_map  = {clean_disease_name(r["Disease"]): r["Medication"]    for _, r in medications_df.iterrows()}
-workout_col      = workout_df.columns[1]
-workout_map      = {clean_disease_name(r["Disease"]): r[workout_col]     for _, r in workout_df.iterrows()}
+description_map = {clean_disease_name(r["Disease"]): r["Description"]  for _, r in description_df.iterrows()}
+diets_map       = {clean_disease_name(r["Disease"]): r["Diet"]          for _, r in diets_df.iterrows()}
+medications_map = {clean_disease_name(r["Disease"]): r["Medication"]    for _, r in medications_df.iterrows()}
+workout_col     = workout_df.columns[1]
+workout_map     = {clean_disease_name(r["Disease"]): r[workout_col]     for _, r in workout_df.iterrows()}
 
 precautions_map = {}
 for _, row in precautions_df.iterrows():
@@ -60,17 +53,29 @@ for _, row in precautions_df.iterrows():
     precs   = [row["Precaution_1"], row["Precaution_2"], row["Precaution_3"], row["Precaution_4"]]
     precautions_map[disease] = [p for p in precs if pd.notna(p)]
 
-disease_names       = list(description_map.keys())
-disease_embeddings  = semantic_model.encode(disease_names, show_progress_bar=False)
-print("✅ Embeddings ready.")
+disease_names = list(description_map.keys())
 
-# Disease → symptoms lookup
 disease_symptoms = {}
 for disease in main_df["diseases"].unique():
-    disease_df = main_df[main_df["diseases"] == disease]
-    cols = disease_df.loc[:, disease_df.columns != "diseases"]
+    d_df = main_df[main_df["diseases"] == disease]
+    cols = d_df.loc[:, d_df.columns != "diseases"]
     syms = cols.columns[(cols == 1).any()].tolist()
     disease_symptoms[disease] = sorted(syms)
+
+# ─── Lazy Sentence Transformer ────────────────────────────────────────────────
+_model = None
+_symptom_emb = None
+_disease_emb = None
+
+def get_model():
+    global _model, _symptom_emb, _disease_emb
+    if _model is None:
+        print("Loading sentence transformer...")
+        _model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        _symptom_emb = _model.encode(symptom_list, show_progress_bar=False)
+        _disease_emb = _model.encode(disease_names, show_progress_bar=False)
+        print("✅ Embeddings ready.")
+    return _model, _symptom_emb, _disease_emb
 
 # ─── Translation ──────────────────────────────────────────────────────────────
 translator = Translator()
@@ -193,10 +198,12 @@ def health_recommender(disease_name, user_age, user_role, current_language="Engl
 
     return recommendations, normal_user_advice
 
-# ─── Integrated Prediction ────────────────────────────────────────────────────
+# ─── Prediction ───────────────────────────────────────────────────────────────
 def integrated_prediction_system(user_input, user_age, user_role, current_language="English", similarity_threshold=0.6):
     if user_age < 18:
         return translate_text("Access Denied: Information is not available for users under 18.", current_language), None
+
+    model, symptom_emb, disease_emb = get_model()
 
     processed_input = user_input
     if current_language.lower() == "amharic":
@@ -212,8 +219,8 @@ def integrated_prediction_system(user_input, user_age, user_role, current_langua
 
     found_symptoms = []
     for phrase in phrases:
-        emb  = semantic_model.encode(phrase)
-        sims = cosine_similarity([emb], symptom_embeddings)[0]
+        emb  = model.encode(phrase)
+        sims = cosine_similarity([emb], symptom_emb)[0]
         idx  = int(np.argmax(sims))
         if sims[idx] > similarity_threshold:
             found_symptoms.append(symptom_list[idx])
@@ -248,6 +255,8 @@ def chatbot_response(user_query, user_age, user_role, current_language="English"
     if user_age < 18:
         return translate_text("Access Denied: Information is not available for users under 18.", current_language)
 
+    model, symptom_emb, disease_emb = get_model()
+
     processed_query = user_query
     if current_language.lower() == "amharic":
         processed_query = translate_to_english(user_query)
@@ -258,9 +267,9 @@ def chatbot_response(user_query, user_age, user_role, current_language="English"
         greeting_response = translate_text("Hello! How can I help you with health information today?", current_language) + " "
 
     found_disease = None
-    query_emb  = semantic_model.encode(processed_query)
-    sims       = cosine_similarity([query_emb], disease_embeddings)[0]
-    best_idx   = int(np.argmax(sims))
+    query_emb = model.encode(processed_query)
+    sims      = cosine_similarity([query_emb], disease_emb)[0]
+    best_idx  = int(np.argmax(sims))
     if sims[best_idx] > similarity_threshold:
         found_disease = disease_names[best_idx]
 
@@ -282,14 +291,12 @@ def chatbot_response(user_query, user_age, user_role, current_language="English"
             if any(w in processed_query for w in ["diet", "eat", "food"]):
                 diet = diets_map.get(found_disease)
                 if current_language.lower() == "amharic":
-                    tl = translate_to_amharic(diet)
-                    diet = ", ".join(tl) if isinstance(tl, list) else tl
+                    tl = translate_to_amharic(diet); diet = ", ".join(tl) if isinstance(tl, list) else tl
                 response_parts.append(f"**{translate_text('Dietary Plan', current_language)} for {found_disease.title()}:** {diet}")
             if any(w in processed_query for w in ["medication", "medicine", "drug", "treatment"]):
                 med = medications_map.get(found_disease)
                 if current_language.lower() == "amharic":
-                    tl = translate_to_amharic(med)
-                    med = ", ".join(tl) if isinstance(tl, list) else tl
+                    tl = translate_to_amharic(med); med = ", ".join(tl) if isinstance(tl, list) else tl
                 response_parts.append(f"**{translate_text('Medications', current_language)} for {found_disease.title()}:** {med}")
             if any(w in processed_query for w in ["precaution", "prevent", "care"]):
                 precs = ", ".join(precautions_map.get(found_disease, ["No specific precautions."]))
@@ -299,8 +306,7 @@ def chatbot_response(user_query, user_age, user_role, current_language="English"
             if any(w in processed_query for w in ["workout", "exercise", "activity"]):
                 wo = workout_map.get(found_disease)
                 if current_language.lower() == "amharic":
-                    tl = translate_to_amharic(wo)
-                    wo = ", ".join(tl) if isinstance(tl, list) else tl
+                    tl = translate_to_amharic(wo); wo = ", ".join(tl) if isinstance(tl, list) else tl
                 response_parts.append(f"**{translate_text('Workout/Activity', current_language)} for {found_disease.title()}:** {wo}")
         elif user_role == "Normal User":
             if any(w in processed_query for w in ["precaution", "prevent", "care"]):
@@ -311,8 +317,7 @@ def chatbot_response(user_query, user_age, user_role, current_language="English"
             if any(w in processed_query for w in ["workout", "exercise", "activity"]):
                 wo = workout_map.get(found_disease)
                 if current_language.lower() == "amharic":
-                    tl = translate_to_amharic(wo)
-                    wo = ", ".join(tl) if isinstance(tl, list) else tl
+                    tl = translate_to_amharic(wo); wo = ", ".join(tl) if isinstance(tl, list) else tl
                 response_parts.append(f"**{translate_text('Workout/Activity', current_language)} for {found_disease.title()}:** {wo}")
 
         if response_parts:
@@ -334,7 +339,7 @@ def index():
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    data = request.json
+    data   = request.json
     result, _ = integrated_prediction_system(
         data.get("symptoms"),
         int(data.get("age", 25)),
